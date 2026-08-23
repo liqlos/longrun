@@ -34,9 +34,11 @@ def swarm_contract() -> dict:
 
 
 def stall_stream() -> list[str]:
-    """Six manager turns, zero research dispatches: the live guard fires every attempt."""
+    """Idle manager turns, zero research dispatches: the live guard fires on the first
+    attempt after six turns and on resumed attempts after their doubled twelve-turn
+    window — an always-idle manager must still land in the swarm budget."""
     return [json.dumps({"type": "step_start", "sessionID": "OC-MANAGER", "part": {}})
-            for _ in range(6)]
+            for _ in range(14)]
 
 
 class AlwaysStallRunner:

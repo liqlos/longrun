@@ -19,8 +19,10 @@ def config_from_contract(contract: dict) -> dict:
         return {}
     return {
         "enabled": True,
-        "researchers": max(1, int(raw.get("researchers", 12))),
-        "workers": max(1, int(raw.get("workers", 5))),
+        # Hard cost ceiling: a bad contract must not be able to demand an
+        # unbounded fanout. The audit target always matches the prompt target.
+        "researchers": min(32, max(1, int(raw.get("researchers", 12)))),
+        "workers": min(16, max(1, int(raw.get("workers", 5)))),
         "task_retries": max(0, int(raw.get("task_retries", 3))),
         "manager_retries": max(0, int(raw.get("manager_retries", 3))),
     }

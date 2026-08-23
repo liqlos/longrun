@@ -520,6 +520,10 @@ def _child_env(store: RunStore, session_id: str, role: str, ttl: int,
             # Background agents outlive individual manager turns only when the
             # run owns a persistent OpenCode server. launch_session provides it.
             env["OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS"] = "true"
+            # Only the manager may launch the one receipt-bound detached
+            # watchdog; workers get the same denies without that exception.
+            worker_bash = {k: v for k, v in builder_bash.items()
+                           if k != "env -u LONGRUN_SESSION_MARKER nohup setsid *"}
             config_content["agent"] = {
                 "swarm-researcher": {
                     "description": "Read-only independent investigator for one manager-assigned Skyline shard.",
@@ -532,7 +536,7 @@ def _child_env(store: RunStore, session_id: str, role: str, ttl: int,
                     "description": "Implementation worker restricted to the exclusive shard owned in its prompt.",
                     "mode": "subagent", "steps": 60,
                     "permission": {"*": "allow", "question": "deny", "task": "deny",
-                                   "external_directory": "deny", "bash": builder_bash},
+                                   "external_directory": "deny", "bash": worker_bash},
                 },
             }
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config_content)
@@ -917,7 +921,11 @@ def launch_session(store: RunStore, runner: ChildRunner, *, role: str, prompt: s
                 swarm_research_dispatch_stalled(
                     live_swarm["actions"], swarm_cfg,
                     manager_turns=turn_cap["count"] - live_swarm["attempt_base_turn"],
-                    last_research_turn=live_swarm["last_research_turn"])):
+                    last_research_turn=live_swarm["last_research_turn"],
+                    # A reconnected manager may legitimately spend turns collecting
+                    # already-running research before dispatching the missing ids;
+                    # resumed attempts get a doubled window, still bounded.
+                    grace_turns=12 if live_swarm["attempt_base_turn"] > 0 else 6)):
             live_swarm["dispatch_stalled"] = True
             stop_flag["fired"] = True
             stop_flag["reasons"] = ["swarm research wave underfilled for six manager turns"]
@@ -1060,17 +1068,25 @@ def launch_session(store: RunStore, runner: ChildRunner, *, role: str, prompt: s
                                                                      "model": model, "attempts": 2})
                 log(store, terminal_stall + "; stopping without Terra fallback")
                 break
+            # The swarm manager budget guards only swarm-shaped failures
+            # (underfilled wave, clean stop without handoff). Generic provider
+            # transport flakiness must not consume it, and its exhaustion must
+            # never be reported as a swarm failure.
+            swarm_recovery = bool(
+                swarm_cfg and opencode_recovery and
+                (opencode_recovery.startswith("swarm_") or opencode_recovery.startswith("clean_stop_")))
             if opencode_builder and _retryable_provider_transport_error(failure_text):
                 max_infra_tries = 6
+            elif swarm_recovery:
+                max_infra_tries = int(swarm_cfg.get("manager_retries", 3))
             else:
-                max_infra_tries = ((int(swarm_cfg.get("manager_retries", 3)) if swarm_cfg else 2)
-                                   if opencode_builder else 6)
+                max_infra_tries = 2 if opencode_builder else 6
             if not infra or infra_tries >= max_infra_tries:
                 # Exhausting the manager recovery budget is its own outcome, not an
                 # ordinary failed builder round: the journal must say so and the
                 # outcome must end honestly instead of buying gate/evaluator/repair
                 # rounds on a manager that never dispatched the swarm.
-                if swarm_cfg and opencode_recovery and infra_tries >= max_infra_tries:
+                if swarm_recovery and infra_tries >= max_infra_tries:
                     store.append_event("session.swarm_recovery_exhausted", {
                         "session_id": sid, "role": role, "reason": opencode_recovery,
                         "tries": infra_tries, "budget": max_infra_tries,

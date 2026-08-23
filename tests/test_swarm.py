@@ -353,7 +353,7 @@ def test_two_consecutive_recoverable_endings_then_success():
             store = make_store(td, swarm_contract(researchers=2, workers=1))
             runner = GuardedFakeRunner([
                 stream_lines(turns_after=6),                       # attempt 1: stall
-                stream_lines(turns_after=6),                       # attempt 2: stalls again
+                stream_lines(turns_after=12),                      # resumed attempt: stalls after its doubled window
                 stream_lines(tasks=[("R01", "swarm-researcher"),
                                     ("R02", "swarm-researcher"),
                                     ("W01", "swarm-worker")], final_text=DONE_MARKER),
@@ -382,7 +382,7 @@ def test_exhausted_manager_budget_is_explicit_not_a_masked_builder_failure():
             store = make_store(td, doc)
             runner = GuardedFakeRunner([
                 stream_lines(turns_after=6),
-                stream_lines(turns_after=6),
+                stream_lines(turns_after=12),   # resumed window is doubled
             ])
             # Exhaustion now surfaces as a terminal ControllerError so the outer
             # loop ends the outcome honestly instead of buying more rounds.
@@ -418,6 +418,37 @@ def test_terminal_provider_error_stops_server_and_background_children():
             assert runner.marker_cleanup_calls["marker_cleanup"] == 1, \
                 "terminal outcome must clean server-owned children"
             assert events_of(store, "session.opencode_server_stopped")
+        finally:
+            if old is None:
+                os.environ.pop("LONGRUN_HOME", None)
+            else:
+                os.environ["LONGRUN_HOME"] = old
+
+
+def test_swarm_fanout_is_clamped_to_a_cost_ceiling():
+    doc = contract()
+    doc["adapter_config"]["builder_swarm"].update({"researchers": 500, "workers": 99})
+    cfg = config_from_contract(doc)
+    assert cfg["researchers"] == 32 and cfg["workers"] == 16
+
+
+def test_worker_profile_denies_the_detached_watchdog_exception():
+    with tempfile.TemporaryDirectory() as td:
+        old = os.environ.get("LONGRUN_HOME")
+        os.environ["LONGRUN_HOME"] = td
+        try:
+            root = Path(td) / "project"
+            root.mkdir()
+            store = RunStore.create(root, "vr_visual", None, {}, driver="opencode")
+            store.contract_path().write_text(json.dumps(contract()))
+            env = _child_env(store, "session", "builder", 60, driver_name="opencode")
+            cfg = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+            parent_bash = cfg["permission"]["bash"]
+            worker_bash = cfg["agent"]["swarm-worker"]["permission"]["bash"]
+            watchdog = "env -u LONGRUN_SESSION_MARKER nohup setsid *"
+            assert parent_bash.get(watchdog) == "allow"
+            assert watchdog not in worker_bash
+            assert worker_bash["*LONGRUN_SESSION_MARKER*"] == "deny"
         finally:
             if old is None:
                 os.environ.pop("LONGRUN_HOME", None)
