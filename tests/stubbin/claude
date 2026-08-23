@@ -1,0 +1,207 @@
+#!/opt/homebrew/opt/python@3.14/bin/python3.14
+"""Stub `claude` for tests. Emits stream-json like `claude -p --output-format stream-json`.
+Behaviour is selected by $LONGRUN_STUB_MODE (a JSON file path) with keys:
+  builder: "submit" | "idle" | "sleep" | "loop" | "tamper" | "self_pass"
+  evaluator: "pass" | "rework" | "bad_hash" | "prose_worse_field_better" | "unknown_crit" | "aggregate" | "mutate"
+  sleep_s: float
+It uses the same LONGRUN_TOKEN env a real session would get, so evidence submission goes through the real CLI.
+"""
+import json, os, subprocess, sys, time, uuid
+from pathlib import Path
+
+argv = sys.argv[1:]
+prompt = argv[argv.index("-p") + 1] if "-p" in argv else ""
+schema = None
+if "--json-schema" in argv:
+    schema = json.loads(argv[argv.index("--json-schema") + 1])
+sid = argv[argv.index("--session-id") + 1] if "--session-id" in argv else str(uuid.uuid4())
+mode = {}
+mp = os.environ.get("LONGRUN_STUB_MODE")
+if mp and Path(mp).is_file():
+    mode = json.loads(Path(mp).read_text())
+role = os.environ.get("LONGRUN_ROLE", "builder")
+run_id = os.environ.get("LONGRUN_RUN_ID", "")
+home = os.environ.get("LONGRUN_HOME", str(Path.home() / ".local/share/longrun"))
+LONGRUN = os.environ.get("LONGRUN_BIN", "longrun")
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+
+
+def tool(name, inp, result, is_error=False):
+    tid = "toolu_" + uuid.uuid4().hex[:8]
+    emit({"type": "assistant", "session_id": sid, "message": {"content": [{"type": "tool_use", "id": tid, "name": name, "input": inp}]}})
+    emit({"type": "user", "session_id": sid, "message": {"content": [{"type": "tool_result", "tool_use_id": tid, "content": result, "is_error": is_error}]}})
+
+
+def result(text="", structured=None, cost=0.01, turns=3):
+    emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False, "result": text,
+          "structured_output": structured, "total_cost_usd": cost, "num_turns": turns, "duration_ms": 1000})
+
+
+emit({"type": "system", "subtype": "init", "session_id": sid})
+if mode.get("sleep_s"):
+    time.sleep(float(mode["sleep_s"]))
+
+if mode.get("weekly_limit") or mode.get("weekly_limit_role") == role:
+    emit({"type": "result", "subtype": "error", "session_id": sid, "is_error": True,
+          "result": "You've hit your weekly limit", "structured_output": None,
+          "total_cost_usd": 0.0, "num_turns": 0, "duration_ms": 300})
+    sys.exit(1)
+
+# A per-model usage limit: the session dies immediately, having done no work, with the message the provider
+# actually prints. Named for the model so the fallback (which is a *different* model) still succeeds.
+_model_arg = argv[argv.index("--model") + 1] if "--model" in argv else ""
+if mode.get("limit_model") and _model_arg == mode["limit_model"]:
+    emit({"type": "result", "subtype": "error", "session_id": sid, "is_error": True,
+          "result": "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.",
+          "structured_output": None, "total_cost_usd": 0.0, "num_turns": 0, "duration_ms": 300})
+    sys.exit(1)
+
+if role == "builder":
+    b = mode.get("builder", "submit")
+    ws = Path.cwd()
+    if b == "sleep":
+        time.sleep(600)
+    if b == "submit":
+        (ws / "feature.txt").write_text("done\n")
+        subprocess.run(["git", "add", "-A"], cwd=ws, capture_output=True); subprocess.run(["git", "commit", "-qm", "stub"], cwd=ws, capture_output=True)
+        tool("Write", {"file_path": str(ws / "feature.txt"), "content": "done"}, "ok")
+        for cid in mode.get("criteria", ["C1"]):
+            r = subprocess.run([LONGRUN, "evidence", "submit", "--criterion", cid, "--kind", "check", "--summary", f"stub check for {cid}: test -f feature.txt exit 0", "--cmd", "test -f feature.txt", "--exit", "0"], capture_output=True, text=True)
+            tool("Bash", {"command": f"longrun evidence submit --criterion {cid}"}, r.stdout + r.stderr, r.returncode != 0)
+    elif b == "idle":
+        tool("Read", {"file_path": str(ws / "README.md")}, "nothing")
+    elif b == "loop":
+        for _ in range(4):
+            tool("Bash", {"command": "pytest -q"}, "E   AssertionError: boom\nFAILED test_x.py::test_a", True)
+    elif b == "tamper":
+        sp = Path(home) / "runs" / run_id / "state.json"
+        d = json.loads(sp.read_text()); d["criteria"] = {k: {"status": "PASS", "evidence_ids": [], "history": []} for k in d.get("criteria", {})}
+        sp.write_text(json.dumps(d))
+        tool("Bash", {"command": "edit state.json"}, "ok")
+    elif b == "self_pass":
+        r = subprocess.run([LONGRUN, "evaluate", "--run", run_id], capture_output=True, text=True)
+        tool("Bash", {"command": "longrun evaluate"}, r.stdout + r.stderr, r.returncode != 0)
+        r2 = subprocess.run([LONGRUN, "evidence", "submit", "--criterion", "C1", "--kind", "check", "--summary", "PASS PASS PASS", "--cmd", "true", "--exit", "0", "--run-id", "00000000-0000-0000-0000-000000000000"], capture_output=True, text=True)
+        tool("Bash", {"command": "longrun evidence submit --run-id other"}, r2.stdout + r2.stderr, r2.returncode != 0)
+    result("builder done")
+    sys.exit(0)
+
+if role in ("evaluator", "restart_manager", "planner", "contract_repair", "intent_reviewer"):
+    e = mode.get("evaluator", "pass")
+    if role in ("planner", "contract_repair"):
+        spec = {"outcome_id": "O-auto", "observable_end_state": "feature.txt exists in the workspace and the checks pass (auto-planned)",
+                "batch": {"boundary": "feature file implemented", "reality_test": "feature check passes", "estimated_seconds": 600, "max_foreground_seconds": 60, "deferred_required_outcomes": []},
+                "criteria": [{"id": "C1", "statement": "feature.txt exists and the check passes", "kind": "functional", "evidence_requirements": ["check"],
+                              "deterministic_checks": [{"cmd": "test -f feature.txt"}], "evaluator_policy": "llm_required"},
+                             {"id": "C2", "statement": "the workspace README still exists after the change", "kind": "functional", "evidence_requirements": ["check"],
+                              "deterministic_checks": [{"cmd": "test -f README.md"}], "evaluator_policy": "deterministic_only"}],
+                "constraints": ["KEEP_SENTINEL"] if mode.get("intent_review") == "reject_first" else [], "non_goals": [], "allowed_replace_remove": [], "allowed_commands": [],
+                "budgets": {"wall_time_seconds": 600, "child_timeout_seconds": 60, "max_rounds": 3,
+                            "max_repairs": 1, "max_fresh_restarts": int(mode.get("max_fresh_restarts", 0))},
+                "adapter_config": {}, "rationale": "stub"}
+        if role == "planner" and mode.get("planner") == "bad_first" and not (Path(home) / "runs" / run_id / "planner_retry").exists():
+            (Path(home) / "runs" / run_id / "planner_retry").write_text("1"); spec["criteria"] = spec["criteria"][:1]; spec["criteria"][0]["kind"] = "user_facing"
+        result(json.dumps(spec), spec); sys.exit(0)
+    if role == "restart_manager":
+        result("", {"decision": mode.get("restart_decision", "DISCARD"), "rationale": "stub", "keep_paths": [], "discard_paths": [], "new_hypothesis": "try the other thing"})
+        sys.exit(0)
+    if role == "intent_reviewer":
+        if mode.get("intent_review") == "owner_conflict":
+            result("", {"verdict": "OWNER_CONFIRMATION_REQUIRED", "material_mismatches": [],
+                "owner_objection": {
+                    "objection_key": "unsafe-owner-route",
+                    "owner_instruction": "use the unsafe route",
+                    "conflict": "the route conflicts with two authoritative requirements",
+                    "likely_harm": "the requested outcome would be materially invalid",
+                    "confidence": 0.96,
+                    "sources": [
+                        {"source_class": "project_knowledge", "title": "Project knowledge", "locator": "docs/KNOWLEDGE.md:12", "support": "requires the supported route"},
+                        {"source_class": "official_documentation", "title": "Official documentation", "locator": "https://example.test/official#route", "support": "the unsafe route is unsupported"}
+                    ],
+                    "question": "The requested route is very likely to invalidate the outcome. Do you still want it?"
+                }, "summary": "high-confidence sourced owner conflict"})
+            sys.exit(0)
+        if mode.get("intent_review") == "reject_always":
+            result("", {"verdict": "REJECT", "material_mismatches": [{
+                "owner_instruction": "make feature.txt exist",
+                "contract_effect": "the proposed pass condition still permits a different file",
+                "reason": "the explicit deliverable remains weakened",
+            }], "owner_objection": None, "summary": "material owner-intent mismatch"})
+            sys.exit(0)
+        if mode.get("intent_review") == "reject_first":
+            marker = Path(home) / "runs" / run_id / "intent_review_retry"
+            if not marker.exists():
+                marker.write_text("1")
+                result("", {"verdict": "REJECT", "material_mismatches": [{
+                    "owner_instruction": "make feature.txt exist",
+                    "contract_effect": "the proposed pass condition permits a different file",
+                    "reason": "the explicit deliverable was weakened",
+                }], "owner_objection": None, "summary": "material owner-intent mismatch"})
+                sys.exit(0)
+        result("", {"verdict": "PASS", "material_mismatches": [], "owner_objection": None,
+                    "summary": "owner intent preserved"})
+        sys.exit(0)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from longrun.store import RunStore
+    from longrun.evidence import evidence_manifest
+    from longrun import gitutil as G
+    st = RunStore(run_id); s = st.read(verify=False)
+    ws = Path(s["workspace"] or s["project_root"])
+    rev = G.content_revision(ws)
+    man = evidence_manifest(st, revision=rev)
+    contract = json.loads(st.contract_path().read_text())
+    crits = []
+    for c in contract["criteria"]:
+        eids = [m["id"] for m in man if c["id"] in m["criterion_ids"] and m["submitted_by"] not in ("controller:baseline",)]
+        crits.append({"id": c["id"], "verdict": "PASS" if (e == "pass" and eids) else "FAIL", "evidence_ids": eids if e == "pass" else [], "reason": "stub reason text"})
+    obj = {"run_id": run_id, "contract_hash": s["contract_hash"], "evaluated_revision": rev, "criteria": crits,
+           "overall": "PASS" if all(c["verdict"] == "PASS" for c in crits) else "NEEDS_REWORK",
+           "failure_signature": "" if e == "pass" else "stub-signature-same", "recommended_next_strategy": "keep going"}
+    if e == "bad_hash":
+        obj["contract_hash"] = "deadbeef"
+    if e == "unknown_crit":
+        obj["criteria"].append({"id": "ZZZ", "verdict": "PASS", "evidence_ids": [], "reason": "made up"})
+    if e == "cite_badly_once":
+        # First call cites another criterion's evidence (the validator rejects it); the retry cites correctly.
+        # This is the shape of the two verdicts that were discarded whole one night, $10.35 of judgement.
+        marker = Path(home) / "runs" / run_id / "eval_retry"
+        if not marker.exists():
+            marker.write_text("1")
+            wrong = next((m["id"] for m in man if m["submitted_by"] not in ("controller:baseline",)), None)
+            for c in obj["criteria"]:
+                c["verdict"] = "PASS"; c["evidence_ids"] = [wrong] if wrong else []
+            obj["overall"] = "PASS"
+        else:
+            for c in obj["criteria"]:
+                eids = [m["id"] for m in man if c["id"] in m["criterion_ids"] and m["submitted_by"] not in ("controller:baseline",)]
+                c["verdict"] = "PASS" if eids else "FAIL"; c["evidence_ids"] = eids
+            obj["overall"] = "PASS" if all(c["verdict"] == "PASS" for c in obj["criteria"]) else "NEEDS_REWORK"
+    if e == "upgrade_on_retry":
+        # First call is invalid; the retry tries to turn a FAIL into a PASS. The controller must discard it.
+        marker = Path(home) / "runs" / run_id / "eval_retry"
+        if not marker.exists():
+            marker.write_text("1")
+            for c in obj["criteria"]:
+                c["verdict"] = "FAIL"; c["evidence_ids"] = ["Edeadbeefdead"]
+        else:
+            for c in obj["criteria"]:
+                eids = [m["id"] for m in man if c["id"] in m["criterion_ids"] and m["submitted_by"] not in ("controller:baseline",)]
+                c["verdict"] = "PASS" if eids else "FAIL"; c["evidence_ids"] = eids
+            obj["overall"] = "PASS" if all(c["verdict"] == "PASS" for c in obj["criteria"]) else "NEEDS_REWORK"
+    if e == "aggregate":
+        # try to close every criterion with the evidence of the first
+        first = next((m["id"] for m in man if m["submitted_by"] not in ("controller:baseline",)), None)
+        for c in obj["criteria"]:
+            c["verdict"] = "PASS"; c["evidence_ids"] = [first] if first else []
+        obj["overall"] = "PASS"
+    if e == "prose_worse_field_better":
+        result("VERDICT: worse\nThe frame regressed.\n" + json.dumps({**obj, "verdict": "better"}), None)
+        sys.exit(0)
+    if e == "mutate":
+        tool("Write", {"file_path": str(ws / "hacked.txt"), "content": "x"}, "denied", True)
+    result(json.dumps(obj), obj)
+    sys.exit(0)
+result("unknown role")
